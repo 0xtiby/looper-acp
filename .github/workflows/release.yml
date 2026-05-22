@@ -2,32 +2,48 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   release:
+    name: Release
     runs-on: ubuntu-latest
     permissions:
       contents: write
       issues: write
       pull-requests: write
       id-token: write
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-      - uses: pnpm/action-setup@v4
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
         with:
-          version: 9
-      - run: pnpm install
-      - run: pnpm run typecheck
-      - run: pnpm run lint
-      - run: pnpm run test
-      - run: pnpm run build
-      - env:
+          version: 9.15.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: pnpm
+
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Release
+        env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: pnpm dlx semantic-release
+        run: npx semantic-release
