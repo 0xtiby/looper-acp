@@ -23,12 +23,23 @@ export {
   runAcpIteration,
 } from "./acp-client.js";
 
+import { randomUUID } from "node:crypto";
 import {
   type AcpIterationOptions,
   type AcpIterationResult,
   runAcpIteration,
 } from "./acp-client.js";
 import { tokenizeCommand } from "./agent-resolver.js";
+import {
+  appendSessionEvents,
+  appendSessionLog,
+  createSession,
+  getSessionDir,
+  readSession,
+  type Session,
+  writeSessionJson,
+  writeSessionState,
+} from "./session.js";
 import { substitute } from "./template.js";
 
 export type StopReason = "sentinel" | "max_iterations" | "error" | "aborted";
@@ -87,14 +98,20 @@ export interface LoopDeps {
   resolveAgent?: (agentId: string) => Promise<{ bin: string; args: string[] }>;
 }
 
+const DEFAULT_MAX_ITERATIONS = 10;
+const DEFAULT_SENTINEL = ":::LOOPER_DONE:::";
+
 export async function loop(
   options: LoopOptions,
   deps: LoopDeps = {},
 ): Promise<LoopResult> {
-  const maxIterations = options.maxIterations ?? 10;
-  const sentinel = options.sentinel ?? ":::LOOPER_DONE:::";
+  const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  const sentinel = options.sentinel ?? DEFAULT_SENTINEL;
   const vars = options.vars ?? {};
   const startIteration = options.startIteration ?? 1;
+  const sessionId = options.sessionId ?? randomUUID();
+  const debug = options.debug ?? false;
+  const cwd = options.cwd;
 
   // Build spawn command
   let command: { bin: string; args: string[] };
@@ -113,6 +130,38 @@ export async function loop(
 
   const run = deps.runIteration ?? runAcpIteration;
 
+  // Session setup
+  let session: Session;
+  const sessionDir = getSessionDir(cwd, sessionId);
+
+  if (options.sessionId) {
+    // Resume existing session
+    session = await readSession(sessionDir);
+    session.state = "active";
+    iterations.push(...session.iterations);
+    await writeSessionState(sessionDir, "active");
+  } else {
+    // New session
+    session = {
+      id: sessionId,
+      state: "active",
+      createdAt: new Date().toISOString(),
+      prompt: options.prompt,
+      agent: options.agent,
+      agentCommand: options.agentCommand,
+      maxIterations,
+      sentinel,
+      vars,
+      cwd,
+      debug,
+      iterations: [],
+    };
+    await createSession(session);
+  }
+
+  // Collect raw ACP events for debug mode
+  const events: unknown[] = [];
+
   for (let i = startIteration; i <= maxIterations; i++) {
     if (options.signal?.aborted) {
       stopReason = "aborted";
@@ -122,7 +171,7 @@ export async function loop(
     const promptVars = {
       ITERATION: String(i),
       MAX_ITERATIONS: String(maxIterations),
-      SESSION_ID: options.sessionId ?? "",
+      SESSION_ID: sessionId,
       ...vars,
     };
     const prompt = substitute(options.prompt, promptVars);
@@ -133,9 +182,12 @@ export async function loop(
     try {
       const iterationResult = await run({
         prompt,
-        cwd: options.cwd,
+        cwd,
         command,
         onOutput: options.onOutput,
+        onSessionUpdate: debug
+          ? (notification) => events.push(notification)
+          : undefined,
         signal: options.signal,
       });
 
@@ -159,6 +211,15 @@ export async function loop(
         iterationResult.stopReason === "cancelled"
       ) {
         iterations.push(result);
+        session.iterations.push(result);
+        await appendSessionLog(sessionDir, result);
+        await writeSessionJson(sessionDir, session);
+        if (debug && events.length > 0) {
+          await appendSessionEvents(
+            sessionDir,
+            events.splice(0, events.length),
+          );
+        }
         stopReason = "aborted";
         break;
       }
@@ -171,6 +232,15 @@ export async function loop(
           raw: iterationResult.error.stack ?? iterationResult.error.message,
         };
         iterations.push(result);
+        session.iterations.push(result);
+        await appendSessionLog(sessionDir, result);
+        await writeSessionJson(sessionDir, session);
+        if (debug && events.length > 0) {
+          await appendSessionEvents(
+            sessionDir,
+            events.splice(0, events.length),
+          );
+        }
         stopReason = "error";
         break;
       }
@@ -183,6 +253,15 @@ export async function loop(
           raw: iterationResult.stopReason,
         };
         iterations.push(result);
+        session.iterations.push(result);
+        await appendSessionLog(sessionDir, result);
+        await writeSessionJson(sessionDir, session);
+        if (debug && events.length > 0) {
+          await appendSessionEvents(
+            sessionDir,
+            events.splice(0, events.length),
+          );
+        }
         stopReason = "error";
         break;
       }
@@ -191,14 +270,29 @@ export async function loop(
       if (iterationResult.text.includes(sentinel)) {
         result.sentinelDetected = true;
         iterations.push(result);
+        session.iterations.push(result);
+        await appendSessionLog(sessionDir, result);
+        await writeSessionJson(sessionDir, session);
+        if (debug && events.length > 0) {
+          await appendSessionEvents(
+            sessionDir,
+            events.splice(0, events.length),
+          );
+        }
         stopReason = "sentinel";
         break;
       }
 
       iterations.push(result);
+      session.iterations.push(result);
+      await appendSessionLog(sessionDir, result);
+      await writeSessionJson(sessionDir, session);
+      if (debug && events.length > 0) {
+        await appendSessionEvents(sessionDir, events.splice(0, events.length));
+      }
     } catch (error) {
       const durationMs = Date.now() - iterationStartTime;
-      iterations.push({
+      const errorResult: IterationResult = {
         number: i,
         stopReason: null,
         sentinelDetected: false,
@@ -211,11 +305,61 @@ export async function loop(
           message: error instanceof Error ? error.message : String(error),
           raw: String(error),
         },
-      });
+      };
+      iterations.push(errorResult);
+      session.iterations.push(errorResult);
+      await appendSessionLog(sessionDir, errorResult);
+      await writeSessionJson(sessionDir, session);
+      if (debug && events.length > 0) {
+        await appendSessionEvents(sessionDir, events.splice(0, events.length));
+      }
       stopReason = "error";
       break;
     }
   }
 
+  // Final state update
+  const finalState: Session["state"] =
+    stopReason === "aborted" || stopReason === "error"
+      ? "interrupted"
+      : "completed";
+  session.state = finalState;
+  session.completedAt = new Date().toISOString();
+  await writeSessionState(sessionDir, finalState);
+  await writeSessionJson(sessionDir, session);
+
   return { iterations, stopReason };
+}
+
+export interface ResumeOptions {
+  cwd: string;
+  sessionId: string;
+  onOutput?: (chunk: string) => void;
+  signal?: AbortSignal;
+}
+
+export async function resume(
+  options: ResumeOptions,
+  deps: LoopDeps = {},
+): Promise<LoopResult> {
+  const sessionDir = getSessionDir(options.cwd, options.sessionId);
+  const session = await readSession(sessionDir);
+
+  return loop(
+    {
+      prompt: session.prompt,
+      cwd: session.cwd,
+      agent: session.agent,
+      agentCommand: session.agentCommand,
+      maxIterations: session.maxIterations,
+      sentinel: session.sentinel,
+      vars: session.vars,
+      sessionId: session.id,
+      startIteration: session.iterations.length + 1,
+      debug: session.debug,
+      onOutput: options.onOutput,
+      signal: options.signal,
+    },
+    deps,
+  );
 }

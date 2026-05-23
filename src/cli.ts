@@ -2,13 +2,16 @@
 
 import { pathToFileURL } from "node:url";
 import { Command } from "commander";
+import { resolveAgent } from "./agent-resolver.js";
 import { loadConfig, resolveConfig, writeDefaultConfig } from "./config.js";
+import { resume as resumeLoop } from "./index.js";
 import {
   type AcpRegistry,
   type AcpRegistryAgent,
   fetchAndCacheRegistry,
   readCachedRegistry,
 } from "./registry.js";
+import { listInterruptedSessions } from "./session.js";
 
 const program = new Command();
 
@@ -65,10 +68,8 @@ program
 program
   .command("resume [session-id]")
   .description("Resume an interrupted session")
-  .action((_sessionId) => {
-    // TODO(#7): implement resume
-    console.error("resume not yet implemented");
-    process.exit(1);
+  .action(async (sessionId?: string) => {
+    await resume({ cwd: process.cwd(), sessionId });
   });
 
 const isMain =
@@ -193,4 +194,60 @@ export async function agents(
         row.distribution,
     );
   }
+}
+
+export interface ResumeDeps {
+  listInterruptedSessions: typeof listInterruptedSessions;
+  resumeLoop: typeof resumeLoop;
+  readCachedRegistry: typeof readCachedRegistry;
+  resolveAgent: typeof resolveAgent;
+}
+
+export async function resume(
+  options: { cwd: string; sessionId?: string },
+  deps: ResumeDeps = {
+    listInterruptedSessions,
+    resumeLoop,
+    readCachedRegistry,
+    resolveAgent,
+  },
+): Promise<void> {
+  if (!options.sessionId) {
+    const sessions = await deps.listInterruptedSessions(options.cwd);
+    if (sessions.length === 0) {
+      console.log("No interrupted sessions found.");
+      return;
+    }
+    for (const session of sessions) {
+      const iterCount = session.iterations.length;
+      console.log(
+        `${session.id}  prompt: "${session.prompt}"  iterations: ${iterCount}`,
+      );
+    }
+    return;
+  }
+
+  const resolveAgentDep = async (agentId: string) => {
+    const registry = await deps.readCachedRegistry();
+    if (!registry) {
+      throw new Error(
+        "No registry cache found. Run `looper-acp init` or `looper-acp agents --refresh`.",
+      );
+    }
+    const cmd = deps.resolveAgent(agentId, registry);
+    return { bin: cmd.bin, args: cmd.args };
+  };
+
+  const result = await deps.resumeLoop(
+    {
+      cwd: options.cwd,
+      sessionId: options.sessionId,
+      onOutput: (chunk) => process.stdout.write(chunk),
+    },
+    { resolveAgent: resolveAgentDep },
+  );
+
+  console.log(`Session ${options.sessionId} resumed.`);
+  console.log(`Stop reason: ${result.stopReason}`);
+  console.log(`Total iterations: ${result.iterations.length}`);
 }

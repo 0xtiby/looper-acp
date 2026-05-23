@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, config, init } from "./cli.js";
+import { agents, config, init, resume } from "./cli.js";
 import type { AcpRegistry } from "./registry.js";
 
 describe("init", () => {
@@ -236,5 +236,108 @@ describe("agents", () => {
     );
 
     expect(logs.some((l) => /No agents in registry/i.test(l))).toBe(true);
+  });
+});
+
+describe("resume", () => {
+  let workDir: string;
+
+  beforeEach(async () => {
+    workDir = await mkdtemp(path.join(tmpdir(), "looper-acp-cli-resume-"));
+  });
+
+  afterEach(async () => {
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  it("lists interrupted sessions when no session-id is given", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((msg: unknown) =>
+      logs.push(String(msg)),
+    );
+
+    const listInterruptedSessions = vi.fn().mockResolvedValue([
+      {
+        id: "session-1",
+        state: "interrupted",
+        createdAt: "2026-05-23T10:00:00.000Z",
+        prompt: "fix bug",
+        maxIterations: 5,
+        sentinel: ":::DONE:::",
+        vars: {},
+        cwd: workDir,
+        debug: false,
+        iterations: [{ number: 1 }, { number: 2 }],
+      },
+    ]);
+
+    await resume(
+      { cwd: workDir },
+      {
+        listInterruptedSessions,
+        resumeLoop: vi.fn(),
+        readCachedRegistry: vi.fn(),
+        resolveAgent: vi.fn(),
+      },
+    );
+
+    expect(listInterruptedSessions).toHaveBeenCalledWith(workDir);
+    expect(logs.some((l) => l.includes("session-1"))).toBe(true);
+    expect(logs.some((l) => l.includes("fix bug"))).toBe(true);
+    expect(logs.some((l) => l.includes("iterations: 2"))).toBe(true);
+  });
+
+  it("prints a message when no interrupted sessions exist", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((msg: unknown) =>
+      logs.push(String(msg)),
+    );
+
+    const listInterruptedSessions = vi.fn().mockResolvedValue([]);
+
+    await resume(
+      { cwd: workDir },
+      {
+        listInterruptedSessions,
+        resumeLoop: vi.fn(),
+        readCachedRegistry: vi.fn(),
+        resolveAgent: vi.fn(),
+      },
+    );
+
+    expect(logs.some((l) => /No interrupted sessions/i.test(l))).toBe(true);
+  });
+
+  it("resumes a specific session and prints summary", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((msg: unknown) =>
+      logs.push(String(msg)),
+    );
+
+    const resumeLoop = vi.fn().mockResolvedValue({
+      stopReason: "sentinel",
+      iterations: [{ number: 1 }, { number: 2 }, { number: 3 }],
+    });
+
+    await resume(
+      { cwd: workDir, sessionId: "session-abc" },
+      {
+        listInterruptedSessions: vi.fn(),
+        resumeLoop,
+        readCachedRegistry: vi.fn().mockResolvedValue({
+          version: "1.0.0",
+          agents: [],
+        } as AcpRegistry),
+        resolveAgent: vi.fn(),
+      },
+    );
+
+    expect(resumeLoop).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: workDir, sessionId: "session-abc" }),
+      expect.anything(),
+    );
+    expect(logs.some((l) => l.includes("session-abc"))).toBe(true);
+    expect(logs.some((l) => l.includes("sentinel"))).toBe(true);
+    expect(logs.some((l) => l.includes("3"))).toBe(true);
   });
 });
