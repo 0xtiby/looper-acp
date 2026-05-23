@@ -10,7 +10,8 @@ export function substitute(
   vars: Record<string, string>,
 ): string {
   return template.replace(/\{\{(\w+)\}\}/g, (_match, key) => {
-    return key in vars ? vars[key]! : `{{${key}}}`;
+    const value = vars[key];
+    return value ?? `{{${key}}}`;
   });
 }
 

@@ -4,7 +4,10 @@ import { Command } from "commander";
 
 const program = new Command();
 
-program.name("looper-acp").description("ACP-native Ralph Loop engine").version("0.0.0-development");
+program
+  .name("looper-acp")
+  .description("ACP-native Ralph Loop engine")
+  .version("0.0.0-development");
 
 program
   .command("init")
@@ -44,7 +47,12 @@ program
   .option("--max-iterations <n>", "Cap the number of iterations")
   .option("--sentinel <string>", "String the agent must emit to stop the loop")
   .option("--cwd <path>", "Working directory for the spawned agent")
-  .option("--var <pair>", "Template variable KEY=VALUE (repeatable)", collectVars, {})
+  .option(
+    "--var <pair>",
+    "Template variable KEY=VALUE (repeatable)",
+    collectVars,
+    {},
+  )
   .option("--debug", "Write raw ACP events to NDJSON transcript")
   .action((_opts) => {
     // TODO(#7): implement run
@@ -63,7 +71,10 @@ program
 
 program.parse();
 
-function collectVars(value: string, previous: Record<string, string>): Record<string, string> {
+function collectVars(
+  value: string,
+  previous: Record<string, string>,
+): Record<string, string> {
   const idx = value.indexOf("=");
   if (idx === -1) throw new Error(`Invalid var: ${value} (expected KEY=VALUE)`);
   return { ...previous, [value.slice(0, idx)]: value.slice(idx + 1) };

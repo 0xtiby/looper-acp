@@ -8,6 +8,15 @@
  * The filesystem is the only memory between turns.
  */
 
+export type {
+  AcpHelloWorldOptions,
+  AcpHelloWorldResult,
+  AcpSpawnCommand,
+  CreateLooperAcpClientOptions,
+  LooperAcpClient,
+} from "./acp-client.js";
+export { createLooperAcpClient, runAcpHelloWorld } from "./acp-client.js";
+
 export type StopReason = "sentinel" | "max_iterations" | "error" | "aborted";
 
 export interface IterationError {
@@ -61,12 +70,7 @@ export interface LoopOptions {
   resolveAgent?: (id: string) => Promise<{ bin: string; args: string[] }>;
 }
 
-export interface LoopDeps {
-  // Future: injectable spawner, client factory, etc.
-}
-
-const DEFAULT_MAX_ITERATIONS = 10;
-const DEFAULT_SENTINEL = ":::LOOPER_DONE:::";
+export type LoopDeps = Record<never, never>;
 
 export async function loop(
   _options: LoopOptions,
