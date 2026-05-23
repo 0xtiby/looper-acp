@@ -51,6 +51,26 @@ export interface AcpHelloWorldResult {
   killed: boolean;
 }
 
+export interface AcpIterationOptions {
+  prompt: string;
+  cwd: string;
+  command: AcpSpawnCommand;
+  onOutput?: (chunk: string) => void;
+  onSessionUpdate?: (notification: SessionNotification) => void;
+  signal?: AbortSignal;
+}
+
+export interface AcpIterationResult {
+  protocolVersion: number;
+  sessionId: string;
+  stopReason: string;
+  text: string;
+  killed: boolean;
+  durationMs: number;
+  startedAt: string;
+  error: Error | null;
+}
+
 const DEFAULT_PROTOCOL_VERSION = 1;
 
 export function createLooperAcpClient(
@@ -113,8 +133,28 @@ export function createLooperAcpClient(
 export async function runAcpHelloWorld(
   options: AcpHelloWorldOptions,
 ): Promise<AcpHelloWorldResult> {
+  const result = await runAcpIteration({
+    prompt: options.prompt,
+    cwd: options.cwd,
+    command: options.command ?? defaultHelloWorldCommand(),
+    onOutput: options.onOutput,
+  });
+  return {
+    protocolVersion: result.protocolVersion,
+    sessionId: result.sessionId,
+    stopReason: result.stopReason,
+    text: result.text,
+    killed: result.killed,
+  };
+}
+
+export async function runAcpIteration(
+  options: AcpIterationOptions,
+): Promise<AcpIterationResult> {
+  const startedAt = new Date().toISOString();
+  const startTime = Date.now();
   const cwd = resolve(options.cwd);
-  const command = options.command ?? defaultHelloWorldCommand();
+  const command = options.command;
   const child = spawn(command.bin, command.args ?? [], {
     cwd,
     env: { ...process.env, ...command.env },
@@ -126,7 +166,8 @@ export async function runAcpHelloWorld(
 
   const client = createLooperAcpClient({
     cwd,
-    onOutput: options.onOutput ?? ((chunk) => process.stdout.write(chunk)),
+    onOutput: options.onOutput,
+    onSessionUpdate: options.onSessionUpdate,
   });
   const connection = new ClientSideConnection(
     () => client,
@@ -134,6 +175,22 @@ export async function runAcpHelloWorld(
   );
 
   let killed = false;
+  let sessionId = "";
+  let aborted = false;
+
+  const onAbort = async () => {
+    aborted = true;
+    if (sessionId) {
+      try {
+        await connection.cancel({ sessionId });
+      } catch {
+        // ignore
+      }
+    }
+    await terminateChild(child);
+  };
+
+  options.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     const initializeResponse = await connection.initialize({
@@ -142,28 +199,66 @@ export async function runAcpHelloWorld(
       clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
     });
     const session = await connection.newSession({ cwd, mcpServers: [] });
+    sessionId = session.sessionId;
+
     const promptResponse = await connection.prompt({
       sessionId: session.sessionId,
       prompt: [{ type: "text", text: options.prompt }],
     });
 
+    // Check if agent exited with non-zero code before we kill it
+    if (child.exitCode !== null && child.exitCode !== 0) {
+      throw new Error(`Agent exited with non-zero code: ${child.exitCode}`);
+    }
+
     killed = await terminateChild(child);
+
+    if (aborted || options.signal?.aborted) {
+      return {
+        protocolVersion: initializeResponse.protocolVersion,
+        sessionId,
+        stopReason: "cancelled",
+        text: client.getTranscript(),
+        killed,
+        durationMs: Date.now() - startTime,
+        startedAt,
+        error: null,
+      };
+    }
 
     return {
       protocolVersion: initializeResponse.protocolVersion,
-      sessionId: session.sessionId,
+      sessionId,
       stopReason: promptResponse.stopReason,
       text: client.getTranscript(),
       killed,
+      durationMs: Date.now() - startTime,
+      startedAt,
+      error: null,
     };
   } catch (error) {
     await terminateChild(child);
+
+    if (aborted || options.signal?.aborted) {
+      return {
+        protocolVersion: DEFAULT_PROTOCOL_VERSION,
+        sessionId,
+        stopReason: "cancelled",
+        text: client.getTranscript(),
+        killed: true,
+        durationMs: Date.now() - startTime,
+        startedAt,
+        error: null,
+      };
+    }
+
     const stderrText = stderr.join("").trim();
     if (stderrText.length > 0 && error instanceof Error) {
       error.message = `${error.message}\nAgent stderr:\n${stderrText}`;
     }
     throw error;
   } finally {
+    options.signal?.removeEventListener("abort", onAbort);
     await connection.closed.catch(() => undefined);
   }
 }

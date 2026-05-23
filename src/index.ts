@@ -15,7 +15,21 @@ export type {
   CreateLooperAcpClientOptions,
   LooperAcpClient,
 } from "./acp-client.js";
-export { createLooperAcpClient, runAcpHelloWorld } from "./acp-client.js";
+export {
+  type AcpIterationOptions,
+  type AcpIterationResult,
+  createLooperAcpClient,
+  runAcpHelloWorld,
+  runAcpIteration,
+} from "./acp-client.js";
+
+import {
+  type AcpIterationOptions,
+  type AcpIterationResult,
+  runAcpIteration,
+} from "./acp-client.js";
+import { tokenizeCommand } from "./agent-resolver.js";
+import { substitute } from "./template.js";
 
 export type StopReason = "sentinel" | "max_iterations" | "error" | "aborted";
 
@@ -66,16 +80,142 @@ export interface LoopOptions {
   debug?: boolean;
   /** Streaming callback for agent text chunks */
   onOutput?: (chunk: string) => void;
-  /** Optional custom agent resolver */
-  resolveAgent?: (id: string) => Promise<{ bin: string; args: string[] }>;
 }
 
-export type LoopDeps = Record<never, never>;
+export interface LoopDeps {
+  runIteration?: (options: AcpIterationOptions) => Promise<AcpIterationResult>;
+  resolveAgent?: (agentId: string) => Promise<{ bin: string; args: string[] }>;
+}
 
 export async function loop(
-  _options: LoopOptions,
-  _deps: LoopDeps = {},
+  options: LoopOptions,
+  deps: LoopDeps = {},
 ): Promise<LoopResult> {
-  // TODO(#5): Implement the Ralph Loop over ACP.
-  throw new Error("loop() not yet implemented");
+  const maxIterations = options.maxIterations ?? 10;
+  const sentinel = options.sentinel ?? ":::LOOPER_DONE:::";
+  const vars = options.vars ?? {};
+  const startIteration = options.startIteration ?? 1;
+
+  // Build spawn command
+  let command: { bin: string; args: string[] };
+  if (options.agentCommand) {
+    command = tokenizeCommand(options.agentCommand);
+  } else if (options.agent && deps.resolveAgent) {
+    command = await deps.resolveAgent(options.agent);
+  } else if (options.agent) {
+    throw new Error("resolveAgent dependency required when using agent option");
+  } else {
+    throw new Error("Either agentCommand or agent must be provided");
+  }
+
+  const iterations: IterationResult[] = [];
+  let stopReason: StopReason = "max_iterations";
+
+  const run = deps.runIteration ?? runAcpIteration;
+
+  for (let i = startIteration; i <= maxIterations; i++) {
+    if (options.signal?.aborted) {
+      stopReason = "aborted";
+      break;
+    }
+
+    const promptVars = {
+      ITERATION: String(i),
+      MAX_ITERATIONS: String(maxIterations),
+      SESSION_ID: options.sessionId ?? "",
+      ...vars,
+    };
+    const prompt = substitute(options.prompt, promptVars);
+
+    const startedAt = new Date().toISOString();
+    const iterationStartTime = Date.now();
+
+    try {
+      const iterationResult = await run({
+        prompt,
+        cwd: options.cwd,
+        command,
+        onOutput: options.onOutput,
+        signal: options.signal,
+      });
+
+      const durationMs =
+        iterationResult.durationMs ?? Date.now() - iterationStartTime;
+
+      const result: IterationResult = {
+        number: i,
+        stopReason: iterationResult.stopReason,
+        sentinelDetected: false,
+        text: iterationResult.text,
+        startedAt: iterationResult.startedAt ?? startedAt,
+        durationMs,
+        toolCalls: [],
+        error: null,
+      };
+
+      // Abort
+      if (
+        options.signal?.aborted ||
+        iterationResult.stopReason === "cancelled"
+      ) {
+        iterations.push(result);
+        stopReason = "aborted";
+        break;
+      }
+
+      // Actual iteration error (spawn or connection failure)
+      if (iterationResult.error) {
+        result.error = {
+          code: "ITERATION_ERROR",
+          message: iterationResult.error.message,
+          raw: iterationResult.error.stack ?? iterationResult.error.message,
+        };
+        iterations.push(result);
+        stopReason = "error";
+        break;
+      }
+
+      // Non-end_turn stopReason is an error
+      if (iterationResult.stopReason !== "end_turn") {
+        result.error = {
+          code: "NON_END_TURN",
+          message: `Agent stopped with reason: ${iterationResult.stopReason}`,
+          raw: iterationResult.stopReason,
+        };
+        iterations.push(result);
+        stopReason = "error";
+        break;
+      }
+
+      // Check sentinel
+      if (iterationResult.text.includes(sentinel)) {
+        result.sentinelDetected = true;
+        iterations.push(result);
+        stopReason = "sentinel";
+        break;
+      }
+
+      iterations.push(result);
+    } catch (error) {
+      const durationMs = Date.now() - iterationStartTime;
+      iterations.push({
+        number: i,
+        stopReason: null,
+        sentinelDetected: false,
+        text: "",
+        startedAt,
+        durationMs,
+        toolCalls: [],
+        error: {
+          code: "EXCEPTION",
+          message: error instanceof Error ? error.message : String(error),
+          raw: String(error),
+        },
+      });
+      stopReason = "error";
+      break;
+    }
+  }
+
+  return { iterations, stopReason };
 }
