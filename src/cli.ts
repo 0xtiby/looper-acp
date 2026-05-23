@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 
+import { readFile, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { resolveAgent } from "./agent-resolver.js";
-import { loadConfig, resolveConfig, writeDefaultConfig } from "./config.js";
-import { resume as resumeLoop } from "./index.js";
+import {
+  type CliOverrides,
+  loadConfig,
+  resolveConfig,
+  writeDefaultConfig,
+} from "./config.js";
+import { type LoopResult, loop, resume as resumeLoop } from "./index.js";
 import {
   type AcpRegistry,
   type AcpRegistryAgent,
@@ -45,7 +51,7 @@ program
 program
   .command("run")
   .description("Run a Ralph Loop with a prompt")
-  .requiredOption("-p, --prompt <value>", "Inline prompt or path to a file")
+  .option("-p, --prompt <value>", "Inline prompt or path to a file")
   .option("--prompt-stdin", "Read prompt from stdin")
   .option("--agent <id>", "Registry agent ID")
   .option("--agent-command <cmd>", "Raw spawn command for the agent")
@@ -59,10 +65,8 @@ program
     {},
   )
   .option("--debug", "Write raw ACP events to NDJSON transcript")
-  .action((_opts) => {
-    // TODO(#7): implement run
-    console.error("run not yet implemented");
-    process.exit(1);
+  .action(async (opts: RunCliOptions) => {
+    await run(opts);
   });
 
 program
@@ -71,6 +75,142 @@ program
   .action(async (sessionId?: string) => {
     await resume({ cwd: process.cwd(), sessionId });
   });
+
+export interface RunCliOptions {
+  prompt?: string;
+  promptStdin?: boolean;
+  agent?: string;
+  agentCommand?: string;
+  maxIterations?: string;
+  sentinel?: string;
+  cwd?: string;
+  var: Record<string, string>;
+  debug?: boolean;
+}
+
+export interface RunDeps {
+  loadConfig: typeof loadConfig;
+  resolveConfig: typeof resolveConfig;
+  loop: typeof loop;
+  resolveAgent: typeof resolveAgent;
+  readCachedRegistry: typeof readCachedRegistry;
+}
+
+export async function run(
+  opts: RunCliOptions,
+  deps: RunDeps = {
+    loadConfig,
+    resolveConfig,
+    loop,
+    resolveAgent,
+    readCachedRegistry,
+  },
+): Promise<void> {
+  const cwd = opts.cwd ?? process.cwd();
+
+  let prompt: string;
+  if (opts.promptStdin) {
+    prompt = await readStdin();
+  } else if (opts.prompt) {
+    prompt = await resolvePrompt(opts.prompt);
+  } else {
+    console.error("Either --prompt or --prompt-stdin is required");
+    process.exit(1);
+    return;
+  }
+
+  const fileConfig = await deps.loadConfig(cwd);
+  const cliOverrides: CliOverrides = {
+    agent: opts.agent,
+    agentCommand: opts.agentCommand,
+    maxIterations: opts.maxIterations
+      ? parseInt(opts.maxIterations, 10)
+      : undefined,
+    sentinel: opts.sentinel,
+    vars: opts.var,
+    debug: opts.debug,
+  };
+  const resolved = deps.resolveConfig(fileConfig, cliOverrides);
+
+  if (!resolved.agent && !resolved.agentCommand) {
+    console.error(
+      "Either --agent or --agent-command must be provided (or set in config)",
+    );
+    process.exit(1);
+    return;
+  }
+
+  const controller = new AbortController();
+  const onSigint = () => {
+    controller.abort();
+  };
+  process.on("SIGINT", onSigint);
+
+  let result: LoopResult;
+  try {
+    const resolveAgentDep = async (agentId: string) => {
+      const registry = await deps.readCachedRegistry();
+      if (!registry) {
+        throw new Error(
+          "No registry cache found. Run `looper-acp init` or `looper-acp agents --refresh`.",
+        );
+      }
+      const cmd = deps.resolveAgent(agentId, registry);
+      return { bin: cmd.bin, args: cmd.args };
+    };
+
+    result = await deps.loop(
+      {
+        prompt,
+        cwd,
+        agent: resolved.agent,
+        agentCommand: resolved.agentCommand,
+        maxIterations: resolved.maxIterations,
+        sentinel: resolved.sentinel,
+        vars: resolved.vars,
+        debug: resolved.debug,
+        onOutput: (chunk) => process.stdout.write(chunk),
+        signal: controller.signal,
+      },
+      { resolveAgent: resolveAgentDep },
+    );
+  } finally {
+    process.off("SIGINT", onSigint);
+  }
+
+  console.log(`\nStop reason: ${result.stopReason}`);
+  console.log(`Total iterations: ${result.iterations.length}`);
+
+  if (result.stopReason === "aborted") {
+    process.exit(130);
+  } else if (result.stopReason === "error") {
+    process.exit(1);
+  }
+}
+
+async function resolvePrompt(value: string): Promise<string> {
+  try {
+    const s = await stat(value);
+    if (s.isFile()) {
+      return await readFile(value, "utf8");
+    }
+  } catch {
+    // not a file path, treat as inline prompt
+  }
+  return value;
+}
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      data += chunk;
+    });
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", (err) => reject(err));
+  });
+}
 
 const isMain =
   typeof process.argv[1] === "string" &&

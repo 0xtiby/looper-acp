@@ -1,8 +1,9 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, config, init, resume } from "./cli.js";
+import { agents, config, init, resume, run } from "./cli.js";
 import type { AcpRegistry } from "./registry.js";
 
 describe("init", () => {
@@ -339,5 +340,325 @@ describe("resume", () => {
     expect(logs.some((l) => l.includes("session-abc"))).toBe(true);
     expect(logs.some((l) => l.includes("sentinel"))).toBe(true);
     expect(logs.some((l) => l.includes("3"))).toBe(true);
+  });
+});
+
+describe("run", () => {
+  let workDir: string;
+
+  beforeEach(async () => {
+    workDir = await mkdtemp(path.join(tmpdir(), "looper-acp-cli-run-"));
+  });
+
+  afterEach(async () => {
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  it("runs with inline prompt and prints summary", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((msg: unknown) =>
+      logs.push(String(msg)),
+    );
+
+    const loop = vi.fn().mockResolvedValue({
+      stopReason: "sentinel",
+      iterations: [{ number: 1 }],
+    });
+    const loadConfig = vi.fn().mockResolvedValue(null);
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: "test-agent",
+      agentCommand: undefined,
+      maxIterations: 10,
+      sentinel: ":::DONE:::",
+      vars: {},
+      debug: false,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn().mockResolvedValue({
+      version: "1.0.0",
+      agents: [],
+    } as AcpRegistry);
+
+    await run(
+      { prompt: "fix bug", var: {} },
+      { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+    );
+
+    expect(loop).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "fix bug", cwd: expect.any(String) }),
+      expect.anything(),
+    );
+    expect(logs.some((l) => l.includes("sentinel"))).toBe(true);
+    expect(logs.some((l) => l.includes("1"))).toBe(true);
+  });
+
+  it("reads prompt from file when -p points to a file", async () => {
+    const promptFile = path.join(workDir, "prompt.md");
+    await writeFile(promptFile, "file prompt content", "utf8");
+
+    const loop = vi.fn().mockResolvedValue({
+      stopReason: "max_iterations",
+      iterations: [],
+    });
+    const loadConfig = vi.fn().mockResolvedValue(null);
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: "test-agent",
+      agentCommand: undefined,
+      maxIterations: 5,
+      sentinel: ":::DONE:::",
+      vars: {},
+      debug: false,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn().mockResolvedValue({
+      version: "1.0.0",
+      agents: [],
+    } as AcpRegistry);
+
+    await run(
+      { prompt: promptFile, var: {} },
+      { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+    );
+
+    expect(loop).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "file prompt content" }),
+      expect.anything(),
+    );
+  });
+
+  it("reads prompt from stdin when --prompt-stdin is set", async () => {
+    const originalStdin = process.stdin;
+    const mockStdin = new PassThrough();
+    Object.defineProperty(process, "stdin", {
+      value: mockStdin,
+      writable: true,
+      configurable: true,
+    });
+
+    const loop = vi.fn().mockResolvedValue({
+      stopReason: "max_iterations",
+      iterations: [],
+    });
+    const loadConfig = vi.fn().mockResolvedValue(null);
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: "test-agent",
+      agentCommand: undefined,
+      maxIterations: 5,
+      sentinel: ":::DONE:::",
+      vars: {},
+      debug: false,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn().mockResolvedValue({
+      version: "1.0.0",
+      agents: [],
+    } as AcpRegistry);
+
+    const promise = run(
+      { promptStdin: true, var: {} },
+      { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+    );
+
+    mockStdin.end("stdin prompt\n");
+
+    await promise;
+
+    expect(loop).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "stdin prompt\n" }),
+      expect.anything(),
+    );
+
+    Object.defineProperty(process, "stdin", {
+      value: originalStdin,
+      writable: true,
+      configurable: true,
+    });
+  });
+
+  it("passes CLI overrides to resolveConfig with correct precedence", async () => {
+    const loop = vi.fn().mockResolvedValue({
+      stopReason: "sentinel",
+      iterations: [],
+    });
+    const loadConfig = vi.fn().mockResolvedValue({
+      agent: "config-agent",
+      maxIterations: 3,
+    });
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: "cli-agent",
+      agentCommand: "npx -y some-agent",
+      maxIterations: 7,
+      sentinel: ":::STOP:::",
+      vars: { FOO: "bar" },
+      debug: true,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn().mockResolvedValue({
+      version: "1.0.0",
+      agents: [],
+    } as AcpRegistry);
+
+    await run(
+      {
+        prompt: "work",
+        agent: "cli-agent",
+        agentCommand: "npx -y some-agent",
+        maxIterations: "7",
+        sentinel: ":::STOP:::",
+        var: { FOO: "bar" },
+        debug: true,
+      },
+      { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+    );
+
+    expect(loadConfig).toHaveBeenCalledWith(expect.any(String));
+    expect(resolveConfig).toHaveBeenCalledWith(
+      expect.objectContaining({ agent: "config-agent", maxIterations: 3 }),
+      expect.objectContaining({
+        agent: "cli-agent",
+        agentCommand: "npx -y some-agent",
+        maxIterations: 7,
+        sentinel: ":::STOP:::",
+        vars: { FOO: "bar" },
+        debug: true,
+      }),
+    );
+  });
+
+  it("exits with 0 on sentinel stop", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+
+    const loop = vi.fn().mockResolvedValue({
+      stopReason: "sentinel",
+      iterations: [],
+    });
+    const loadConfig = vi.fn().mockResolvedValue(null);
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: "test-agent",
+      agentCommand: undefined,
+      maxIterations: 10,
+      sentinel: ":::DONE:::",
+      vars: {},
+      debug: false,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn().mockResolvedValue({
+      version: "1.0.0",
+      agents: [],
+    } as AcpRegistry);
+
+    await run(
+      { prompt: "work", var: {} },
+      { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+    );
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    exitSpy.mockRestore();
+  });
+
+  it("exits with 1 on error stop", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+
+    const loop = vi.fn().mockResolvedValue({
+      stopReason: "error",
+      iterations: [],
+    });
+    const loadConfig = vi.fn().mockResolvedValue(null);
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: "test-agent",
+      agentCommand: undefined,
+      maxIterations: 10,
+      sentinel: ":::DONE:::",
+      vars: {},
+      debug: false,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn().mockResolvedValue({
+      version: "1.0.0",
+      agents: [],
+    } as AcpRegistry);
+
+    await expect(
+      run(
+        { prompt: "work", var: {} },
+        { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+      ),
+    ).rejects.toThrow("exit");
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    exitSpy.mockRestore();
+  });
+
+  it("exits with 130 on aborted stop", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+
+    const loop = vi.fn().mockResolvedValue({
+      stopReason: "aborted",
+      iterations: [],
+    });
+    const loadConfig = vi.fn().mockResolvedValue(null);
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: "test-agent",
+      agentCommand: undefined,
+      maxIterations: 10,
+      sentinel: ":::DONE:::",
+      vars: {},
+      debug: false,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn().mockResolvedValue({
+      version: "1.0.0",
+      agents: [],
+    } as AcpRegistry);
+
+    await expect(
+      run(
+        { prompt: "work", var: {} },
+        { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+      ),
+    ).rejects.toThrow("exit");
+
+    expect(exitSpy).toHaveBeenCalledWith(130);
+    exitSpy.mockRestore();
+  });
+
+  it("exits with 1 when neither agent nor agentCommand is provided", async () => {
+    const errors: string[] = [];
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit");
+    });
+    vi.spyOn(console, "error").mockImplementation((msg: unknown) =>
+      errors.push(String(msg)),
+    );
+
+    const loop = vi.fn();
+    const loadConfig = vi.fn().mockResolvedValue(null);
+    const resolveConfig = vi.fn().mockReturnValue({
+      agent: undefined,
+      agentCommand: undefined,
+      maxIterations: 10,
+      sentinel: ":::DONE:::",
+      vars: {},
+      debug: false,
+    });
+    const resolveAgent = vi.fn();
+    const readCachedRegistry = vi.fn();
+
+    await expect(
+      run(
+        { prompt: "work", var: {} },
+        { loop, loadConfig, resolveConfig, resolveAgent, readCachedRegistry },
+      ),
+    ).rejects.toThrow("exit");
+
+    expect(loop).not.toHaveBeenCalled();
+    expect(errors.some((e) => /agent/i.test(e))).toBe(true);
+    exitSpy.mockRestore();
   });
 });
