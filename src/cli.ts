@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 
+import { pathToFileURL } from "node:url";
 import { Command } from "commander";
+import { loadConfig, resolveConfig, writeDefaultConfig } from "./config.js";
+import {
+  type AcpRegistry,
+  type AcpRegistryAgent,
+  fetchAndCacheRegistry,
+  readCachedRegistry,
+} from "./registry.js";
 
 const program = new Command();
 
@@ -12,29 +20,23 @@ program
 program
   .command("init")
   .description("Scaffold .looper-acp/config.json and fetch the ACP registry")
-  .action(() => {
-    // TODO(#4): implement init
-    console.error("init not yet implemented");
-    process.exit(1);
+  .action(async () => {
+    await init({ cwd: process.cwd() });
   });
 
 program
   .command("config")
   .description("Print resolved config")
-  .action(() => {
-    // TODO(#4): implement config
-    console.error("config not yet implemented");
-    process.exit(1);
+  .action(async () => {
+    await config({ cwd: process.cwd() });
   });
 
 program
   .command("agents")
   .description("List available ACP agents from the registry")
   .option("--refresh", "Force-refetch the registry from CDN")
-  .action((_opts) => {
-    // TODO(#4): implement agents
-    console.error("agents not yet implemented");
-    process.exit(1);
+  .action(async (opts: { refresh?: boolean }) => {
+    await agents({ refresh: opts.refresh });
   });
 
 program
@@ -69,7 +71,13 @@ program
     process.exit(1);
   });
 
-program.parse();
+const isMain =
+  typeof process.argv[1] === "string" &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  program.parse();
+}
 
 function collectVars(
   value: string,
@@ -78,4 +86,111 @@ function collectVars(
   const idx = value.indexOf("=");
   if (idx === -1) throw new Error(`Invalid var: ${value} (expected KEY=VALUE)`);
   return { ...previous, [value.slice(0, idx)]: value.slice(idx + 1) };
+}
+
+/* ─── Command handlers (exported for tests) ─── */
+
+export interface InitDeps {
+  writeDefaultConfig: typeof writeDefaultConfig;
+  fetchAndCacheRegistry: typeof fetchAndCacheRegistry;
+}
+
+export async function init(
+  options: { cwd: string },
+  deps: InitDeps = { writeDefaultConfig, fetchAndCacheRegistry },
+): Promise<void> {
+  try {
+    const configPath = await deps.writeDefaultConfig(options.cwd);
+    console.log(`Created ${configPath}`);
+  } catch (err) {
+    if (err instanceof Error && /exists/i.test(err.message)) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
+
+  const registry = await deps.fetchAndCacheRegistry();
+  console.log(`Fetched ${registry.agents.length} agents from the ACP registry`);
+}
+
+export interface ConfigDeps {
+  loadConfig: typeof loadConfig;
+  resolveConfig: typeof resolveConfig;
+}
+
+export async function config(
+  options: { cwd: string },
+  deps: ConfigDeps = { loadConfig, resolveConfig },
+): Promise<void> {
+  const fileConfig = await deps.loadConfig(options.cwd);
+  const resolved = deps.resolveConfig(fileConfig);
+  console.log(JSON.stringify(resolved, null, 2));
+}
+
+export interface AgentsDeps {
+  fetchAndCacheRegistry: typeof fetchAndCacheRegistry;
+  readCachedRegistry: typeof readCachedRegistry;
+}
+
+function getDistributionType(agent: AcpRegistryAgent): string {
+  if (agent.distribution.npx) return "npx";
+  if (agent.distribution.uvx) return "uvx";
+  if (agent.distribution.binary) return "binary";
+  return "unknown";
+}
+
+export async function agents(
+  options: { refresh?: boolean },
+  deps: AgentsDeps = { fetchAndCacheRegistry, readCachedRegistry },
+): Promise<void> {
+  let registry: AcpRegistry;
+
+  if (options.refresh) {
+    registry = await deps.fetchAndCacheRegistry();
+    console.log(
+      `Fetched ${registry.agents.length} agents from the ACP registry`,
+    );
+  } else {
+    const cached = await deps.readCachedRegistry();
+    if (!cached) {
+      console.error(
+        "No registry cache found. Run `looper-acp init` or `looper-acp agents --refresh`.",
+      );
+      process.exit(1);
+    }
+    registry = cached;
+  }
+
+  if (registry.agents.length === 0) {
+    console.log("No agents in registry.");
+    return;
+  }
+
+  const rows = registry.agents.map((agent) => ({
+    id: agent.id,
+    name: agent.name,
+    version: agent.version ?? "-",
+    distribution: getDistributionType(agent),
+  }));
+
+  const idWidth = Math.max(2, ...rows.map((r) => r.id.length)) + 2;
+  const nameWidth = Math.max(4, ...rows.map((r) => r.name.length)) + 2;
+  const versionWidth = Math.max(7, ...rows.map((r) => r.version.length)) + 2;
+
+  console.log(
+    "ID".padEnd(idWidth) +
+      "NAME".padEnd(nameWidth) +
+      "VERSION".padEnd(versionWidth) +
+      "DISTRIBUTION",
+  );
+
+  for (const row of rows) {
+    console.log(
+      row.id.padEnd(idWidth) +
+        row.name.padEnd(nameWidth) +
+        row.version.padEnd(versionWidth) +
+        row.distribution,
+    );
+  }
 }
