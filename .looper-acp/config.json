@@ -1,0 +1,15 @@
+{
+  "agent": "claude-agent",
+  "maxIterations": 20,
+  "sentinel": ":::LOOPER_DONE:::",
+  "vars": {
+    "BASE_BRANCH": "main",
+    "PACKAGE_MANAGER": "pnpm",
+    "INSTALL_CMD": "pnpm install",
+    "BUILD_CMD": "pnpm build",
+    "LINT_CMD": "pnpm lint",
+    "TEST_CMD": "pnpm test",
+    "TYPECHECK_CMD": "pnpm typecheck"
+  },
+  "debug": false
+}
